@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-     "start": "node --max-http-header-size=32768 app.js",
+    "start": "node --max-http-header-size=32768 app.js",
     "test": "echo \"Error: no test specified\" && exit 1",
     "test:pinecone": "node pineconeTest.js",
     "test:openai": "node openAiTest.js"
@@ -16,6 +16,7 @@
     "@pinecone-database/pinecone": "^5.1.1",
     "dotenv": "^16.5.0",
     "express": "^5.1.0",
-    "openai": "^4.95.0"
+    "openai": "^4.95.0",
+    "sqlite3": "^5.1.7"
   }
 }

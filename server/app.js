@@ -11,6 +11,8 @@ const http = require('http');
 const { Pinecone } = require('@pinecone-database/pinecone');
 const { OpenAI } = require('openai');
 const cors = require('cors');
+const path = require('path');
+const sqlite3 = require('sqlite3').verbose();
 
 // 3) Initialize Pinecone client
 const pinecone = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
@@ -34,7 +36,29 @@ app.use(cors({
     credentials: false                  // set true if you need to accept/send cookies
   }));
 
-// Configurable threshold for metadata confidence
+  //Initialize admin database  
+  const dbPath = path.resolve(__dirname, '../review.db');
+  const db = new sqlite3.Database(dbPath, err => {
+  if (err) return console.error('❌ SQLite open error:', err);
+  console.log('✅ Connected to SQLite at', dbPath);
+  });
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS review_tips (
+      id TEXT PRIMARY KEY,
+      text TEXT NOT NULL,
+      city TEXT,
+      country TEXT,
+      confidence REAL,
+      moderation TEXT,
+      reason TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `, err => {
+    if (err) console.error('❌ SQLite table creation error:', err);
+  });
+
+  // Configurable threshold for metadata confidence
 const METADATA_CONFIDENCE_THRESHOLD = parseFloat(process.env.METADATA_CONFIDENCE_THRESHOLD) || 0.75;
 
 // 7) POST /ingest - ingest a travel tip
@@ -45,7 +69,7 @@ app.post('/ingest', async (req, res) => {
 
     // a) Extract metadata 
     //const location = extractLocationNaive(tip_text);
-
+    const id = `tip-${Date.now()}`;
     //Moderation
     const mod = await openai.moderations.create({ input: tip_text });
     const scores = mod.results[0].category_scores;
@@ -59,6 +83,21 @@ app.post('/ingest', async (req, res) => {
     mod.results[0].flagged
     ) {
     console.log('🔴 Moderation flagged:', scores);
+    
+    await db.prepare(`
+        INSERT OR IGNORE INTO review_tips
+          (id, text, city, country, confidence, moderation, reason)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        id,
+        tip_text,
+        null,          // city unknown at moderation stage
+        null,          // country unknown
+        null,          // confidence unknown
+        JSON.stringify(mod.results[0]),
+        'flagged by moderation'
+      );
+    
     return res.json({
         status: 'review_needed',
         reason: 'moderation thresholds exceeded',
@@ -89,8 +128,25 @@ app.post('/ingest', async (req, res) => {
   
       // Flag if below threshold
       if (metadata.confidence < METADATA_CONFIDENCE_THRESHOLD) {
-        return res.json({ status: 'review_needed', metadata, reason: 'low confidence' });
-      }
+
+        db.run(
+            `INSERT OR IGNORE INTO review_tips
+               (id, text, city, country, confidence, moderation, reason)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [ id, tip_text, metadata.city, metadata.country, metadata.confidence, null, 'low metadata confidence' ],
+            err => {
+              if (err) console.error('❌ SQLite insert error:', err);
+              else console.log(`✅ Tip ${id} queued for review`);
+              res.json({
+                status: 'review_needed',
+                metadata,
+                reason: 'low confidence'
+              });
+            }
+          );
+        
+          return;  // stop further execution until inside callback
+        }
 
     // b) Create embedding
     const embedResp = await openai.embeddings.create({
@@ -102,7 +158,7 @@ app.post('/ingest', async (req, res) => {
 
     // c) Upsert into Pinecone
     const namespace = 'default';
-    const id = `tip-${Date.now()}`;
+   
     
     const records = [
         {
@@ -180,6 +236,68 @@ app.post('/ask', async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+
+// GET /admin/review
+app.get('/admin/review', (req, res) => {
+    db.all(`SELECT * FROM review_tips ORDER BY created_at DESC`, (err, rows) => {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json(rows);
+    });
+  });
+  
+app.post('/admin/approve/:id', async (req, res) => {
+    const { id } = req.params;
+    const { city: overrideCity, country: overrideCountry } = req.body || {};
+  
+    db.get(`SELECT * FROM review_tips WHERE id = ?`, id, async (err, tip) => {
+      if (err) return res.status(500).json({ error: err.message });
+      if (!tip) return res.status(404).json({ error: 'Not found' });
+  
+      try {
+        // Determine final metadata
+        const finalCity = overrideCity && overrideCity.trim() !== '' ? overrideCity : tip.city;
+        const finalCountry = overrideCountry && overrideCountry.trim() !== '' ? overrideCountry : tip.country;
+  
+        // Re-embed the tip text
+        const embedResp = await openai.embeddings.create({
+          model: 'text-embedding-ada-002',
+          input: tip.text
+        });
+        const vector = embedResp.data[0].embedding;
+        const namespace = 'default';
+  
+        // 3) Upsert into Pinecone with the fresh vector
+        const records = [
+            {
+              id: id,
+              values: vector,
+              metadata: { country: finalCountry.country, city: finalCity.city, text: tip.text },
+            }]
+    
+        await index.namespace(namespace).upsert(records);
+  
+        // 4) Remove from review queue
+        db.run(`DELETE FROM review_tips WHERE id = ?`, id, delErr => {
+            if (delErr) console.error('❌ SQLite delete error:', delErr);
+            res.json({ status: 'approved', id, metadata: { city: finalCity, country: finalCountry } });
+          });
+        } catch (upErr) {
+          console.error('❌ Approve error:', upErr);
+          res.status(500).json({ error: upErr.message });
+        }
+      });
+    });
+  
+  // POST /admin/reject/:id
+  app.post('/admin/reject/:id', (req, res) => {
+    const { id } = req.params;
+    db.run(`DELETE FROM review_tips WHERE id = ?`, id, function(err) {
+      if (err) return res.status(500).json({ error: err.message });
+      if (this.changes === 0) return res.status(404).json({ error: 'Not found' });
+      res.json({ status: 'rejected', id });
+    });
+  });
+  
 
 // 9) Start the server with a larger header limit
  const port = process.env.PORT || 5000;
