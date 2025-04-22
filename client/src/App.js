@@ -1,25 +1,14 @@
-import logo from './logo.svg';
-import './App.css';
+// client/src/App.js
+import TipForm from './TipForm';
+import AskForm from './AskForm';
 
-function App() {
+export default function App() {
   return (
-    <div className="App">
-      <header className="App-header">
-        <img src={logo} className="App-logo" alt="logo" />
-        <p>
-          Edit <code>src/App.js</code> and save to reload.
-        </p>
-        <a
-          className="App-link"
-          href="https://reactjs.org"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          Learn React
-        </a>
-      </header>
+    <div style={{ maxWidth: 600, margin: '2rem auto', padding: '0 1rem' }}>
+      <h1>TravelBot</h1>
+      <TipForm />
+      <hr />
+      <AskForm />
     </div>
   );
 }
-
-export default App;
