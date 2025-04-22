@@ -271,7 +271,7 @@ app.post('/admin/approve/:id', async (req, res) => {
             {
               id: id,
               values: vector,
-              metadata: { country: finalCountry.country, city: finalCity.city, text: tip.text },
+              metadata: { country: finalCountry, city: finalCity, text: tip.text },
             }]
     
         await index.namespace(namespace).upsert(records);
