@@ -66,9 +66,7 @@ app.post('/ingest', async (req, res) => {
   try {
     const { tip_text } = req.body;
     if (!tip_text) return res.status(400).json({ error: 'tip_text is required' });
-
-    // a) Extract metadata 
-    //const location = extractLocationNaive(tip_text);
+   
     const id = `tip-${Date.now()}`;
     //Moderation
     const mod = await openai.moderations.create({ input: tip_text });
@@ -159,7 +157,6 @@ app.post('/ingest', async (req, res) => {
     // c) Upsert into Pinecone
     const namespace = 'default';
    
-    
     const records = [
         {
           id: id,

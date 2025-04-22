@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import axios from 'axios';
 
-// you can leave this if you don't want cookies ever sent
+// disable cookies
 axios.defaults.withCredentials = false;
 
 export default function TipForm() {
@@ -11,20 +11,25 @@ export default function TipForm() {
   const handleSubmit = async e => {
     e.preventDefault();
     try {
-      // 1) Send the request and destructure `data` from the response
       const { data } = await axios.post(
         'http://localhost:5000/ingest',
         { tip_text: tip },
-        {
-          headers: { 'Content-Type': 'application/json' }
-        }
+        { headers: { 'Content-Type': 'application/json' } }
       );
 
-      // 2) Update state on success
-      setStatus(`Saved tip (${data.id}) in ${data.metadata.location}`);
+      // Branch on status returned by your API
+      if (data.status === 'approved') {
+        const { city, country } = data.metadata;
+        setStatus(`👍 Tip saved (${data.id}) for ${city}, ${country}`);
+      } else if (data.status === 'review_needed') {
+        setStatus(`🔎 Tip queued for review: ${data.reason}`);
+      } else {
+        // Fallback for unexpected shape
+        setStatus(`ℹ️ Response: ${JSON.stringify(data)}`);
+      }
+
       setTip('');
     } catch (err) {
-      // 3) Handle errors
       setStatus(`Error: ${err.response?.data?.error || err.message}`);
     }
   };
