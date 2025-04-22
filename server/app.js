@@ -34,15 +34,8 @@ app.use(cors({
     credentials: false                  // set true if you need to accept/send cookies
   }));
 
-// 6) Simple location extractor
-function extractLocationNaive(text) {
-  const knownCities = ['bangkok', 'prague', 'paris', 'london', 'rome'];
-  const lower = text.toLowerCase();
-  for (const city of knownCities) {
-    if (lower.includes(city)) return city[0].toUpperCase() + city.slice(1);
-  }
-  return 'Unknown';
-}
+// Configurable threshold for metadata confidence
+const METADATA_CONFIDENCE_THRESHOLD = parseFloat(process.env.METADATA_CONFIDENCE_THRESHOLD) || 0.75;
 
 // 7) POST /ingest - ingest a travel tip
 app.post('/ingest', async (req, res) => {
@@ -50,8 +43,54 @@ app.post('/ingest', async (req, res) => {
     const { tip_text } = req.body;
     if (!tip_text) return res.status(400).json({ error: 'tip_text is required' });
 
-    // a) Extract metadata
-    const location = extractLocationNaive(tip_text);
+    // a) Extract metadata 
+    //const location = extractLocationNaive(tip_text);
+
+    //Moderation
+    const mod = await openai.moderations.create({ input: tip_text });
+    const scores = mod.results[0].category_scores;
+
+    const VIOLENCE_THRESHOLD = 0.3;
+    const SEXUAL_THRESHOLD   = 0.3;
+
+    if (
+    scores.violence >= VIOLENCE_THRESHOLD ||
+    scores['sexual']  >= SEXUAL_THRESHOLD ||
+    mod.results[0].flagged
+    ) {
+    console.log('🔴 Moderation flagged:', scores);
+    return res.json({
+        status: 'review_needed',
+        reason: 'moderation thresholds exceeded',
+        moderation: mod.results[0]
+    });
+    }
+
+    //Extract metadata, country, city and confidence
+
+    const metaPrompt = [
+        { role: 'system', content: 'Extract the city and country from the following travel tip and output JSON {"city":"...","country":"...","confidence":0.0} where confidence is a number 0–1 representing your certainty.' },
+        { role: 'user', content: tip_text }
+      ];
+      const metaResp = await openai.chat.completions.create({
+        model: 'gpt-3.5-turbo',
+        messages: metaPrompt,
+        temperature: 0,
+        max_tokens: 50
+      });
+      // Parse JSON safely
+      let metadata;
+      try {
+        metadata = JSON.parse(metaResp.choices[0].message.content);
+      } catch (parseErr) {
+        console.warn('Metadata parse error:', parseErr);
+        metadata = { city: 'Unknown', country: 'Unknown', confidence: 0 };
+      }
+  
+      // Flag if below threshold
+      if (metadata.confidence < METADATA_CONFIDENCE_THRESHOLD) {
+        return res.json({ status: 'review_needed', metadata, reason: 'low confidence' });
+      }
 
     // b) Create embedding
     const embedResp = await openai.embeddings.create({
@@ -69,12 +108,12 @@ app.post('/ingest', async (req, res) => {
         {
           id: id,
           values: vector,
-          metadata: { location, text: tip_text },
+          metadata: { country: metadata.country, city: metadata.city, text: tip_text },
         }]
 
     await index.namespace(namespace).upsert(records);
 
-    res.json({ message: 'Tip ingested', id, metadata: { location } });
+    res.json({ message: 'Tip ingested', id, metadata: { country: metadata.country, city: metadata.city } });
   } catch (err) {
     console.error('Ingest error:', err);
     res.status(500).json({ error: err.message });
@@ -86,6 +125,16 @@ app.post('/ask', async (req, res) => {
   try {
     const { query } = req.body;
     if (!query) return res.status(400).json({ error: 'query is required' });
+    // Extract metadata from question
+    const qMetaPrompt = [
+        { role: 'system', content: 'Extract the city and/or country from this question and output JSON {"city":"...","country":"...","confidence":0.0}. If unknown, use "Unknown".' },
+        { role: 'user', content: query }
+      ];
+      const qMetaResp = await openai.chat.completions.create({ model: 'gpt-3.5-turbo', messages: qMetaPrompt, temperature: 0, max_tokens: 50 });
+      let qmetadata;
+      try { qmetadata = JSON.parse(qMetaResp.choices[0].message.content); }
+      catch (e) { console.warn('⚠️ Query metadata parse error:', e); qmetadata = { city: 'Unknown', country: 'Unknown', confidence: 0 }; }
+      console.log('🔍 Query metadata:', qmetadata);
 
     // a) Embed the user query
     const embedResp = await openai.embeddings.create({
@@ -94,36 +143,41 @@ app.post('/ask', async (req, res) => {
     });
     const qVector = embedResp.data[0].embedding;
 
+     // Build filter based on extracted metadata
+     const filter = {};
+     if (qmetadata.city && qmetadata.city !== 'Unknown') filter.city = qmetadata.city;
+     if (qmetadata.country && qmetadata.country !== 'Unknown') filter.country = qmetadata.country;
+     console.log('🔎 Applying filter:', filter);
+
     // b) Query Pinecone
     const namespace = 'default';
     const topK = 3;
     const queryResp = await index.namespace(namespace).query({
       vector: qVector,
       topK,
+      filter,
       includeMetadata: true
     });
 
-    // c) Build context for GPT
-    const snippets = queryResp.matches
-      .map((m, i) => `${i + 1}. (${m.metadata.location}) ${m.metadata.text}`)
-      .join('\n');
+    const snippets = queryResp.matches.map((m,i) => `${i+1}. (${m.metadata.city}, ${m.metadata.country}) ${m.metadata.text}`).join('\n');
+    console.log('📋 Retrieved snippets:', queryResp.matches);
 
-    // d) Call OpenAI chat
+    // 7f) Call OpenAI chat for final answer
     const chatResp = await openai.chat.completions.create({
       model: 'gpt-3.5-turbo',
       messages: [
         { role: 'system', content: 'You are a helpful travel assistant.' },
-        { role: 'user', content: `User asked: "${query}"\n\nHere are relevant tips:\n${snippets}\n\nAnswer using only these tips.` }
+        { role: 'user', content: `User asked: "${query}"\nHere are relevant tips:\n${snippets}\nAnswer using only these tips.` }
       ],
       temperature: 0.7,
       max_tokens: 200
     });
 
     const answer = chatResp.choices[0].message.content.trim();
-    res.json({ answer, retrieved: queryResp.matches });
+    return res.json({ answer, filter_applied: filter, retrieved: queryResp.matches });
   } catch (err) {
-    console.error('Ask error:', err);
-    res.status(500).json({ error: err.message });
+    console.error('❌ Ask error:', err);
+    return res.status(500).json({ error: err.message });
   }
 });
 
